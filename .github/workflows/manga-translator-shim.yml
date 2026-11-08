@@ -1,0 +1,128 @@
+name: manga-translator-shim
+
+# The shim layers a REST endpoint on zyddnys/manga-image-translator, so it is only
+# as reproducible as that base image is pinned. The Dockerfile always said it was
+# "pinned to the same digest the stack was already using" but the FROM line used
+# the floating `:main` tag -- every rebuild could silently move the translator
+# underneath the shim. This workflow resolves the real digest, rewrites FROM to
+# @sha256:..., and only rebuilds when that digest is new.
+
+on:
+  schedule:
+    - cron: "43 4 * * 1" # Mondays 04:43 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if the base digest was already built
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: manga-translator-shim
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      digest: ${{ steps.base.outputs.digest }}
+      tag: ${{ steps.base.outputs.tag }}
+      exists: ${{ steps.check.outputs.exists }}
+    steps:
+      - name: Resolve the current base digest
+        id: base
+        run: |
+          set -euo pipefail
+          base=docker.io/zyddnys/manga-image-translator
+          token=$(curl -fsS "https://auth.docker.io/token?service=registry.docker.io&scope=repository:zyddnys/manga-image-translator:pull" | jq -r .token)
+          # Accept every manifest media type we might be served: the base is amd64-only
+          # but published as an OCI index, so a single-type Accept header 406s.
+          digest=$(curl -fsSI -H "Authorization: Bearer $token" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json' \
+            "https://registry-1.docker.io/v2/zyddnys/manga-image-translator/manifests/main" \
+            | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p' | tr -d '\r')
+          [ -n "$digest" ] || { echo "could not resolve a base digest; refusing to build unpinned"; exit 1; }
+          # Tag by digest prefix: readable, and unique per base image content.
+          tag=$(echo "${digest#sha256:}" | cut -c1-12)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag"       >> "$GITHUB_OUTPUT"
+          echo "base $base@main = $digest (tag $tag)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Was this base already built?
+        id: check
+        run: |
+          set -euo pipefail
+          tag="${{ steps.base.outputs.tag }}"
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://ghcr.io/v2/remusa/manga-translator-shim/manifests/$tag")
+          echo "manifest lookup for tag $tag: HTTP $code"
+          if [ "$code" = "200" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.exists != 'true' || github.event.inputs.force == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Make the Dockerfile's own claim true: pin the FROM to the digest this run
+      # resolved, instead of trusting the floating :main tag.
+      - name: Pin FROM to the resolved digest
+        run: |
+          set -euo pipefail
+          digest='${{ needs.resolve.outputs.digest }}'
+          sed -i "s|^FROM zyddnys/manga-image-translator:main$|FROM zyddnys/manga-image-translator@${digest}|" \
+            manga-translator-shim/Dockerfile
+          grep -n '^FROM ' manga-translator-shim/Dockerfile
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: manga-translator-shim
+          platforms: linux/amd64
+          # The base is ~4.2G; a cold pull dominates this job's runtime.
+          push: true
+          tags: |
+            ghcr.io/remusa/manga-translator-shim:${{ needs.resolve.outputs.tag }}
+            ghcr.io/remusa/manga-translator-shim:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            manga.base.digest=${{ needs.resolve.outputs.digest }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Record the digest to pin
+        run: |
+          {
+            echo "### manga-translator-shim built"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| base digest | \`${{ needs.resolve.outputs.digest }}\` |"
+            echo "| base tag | \`${{ needs.resolve.outputs.tag }}\` |"
+            echo "| **image digest** | \`${{ steps.build.outputs.digest }}\` |"
+            echo ""
+            echo "Pin in Nix:"
+            echo ""
+            echo '```nix'
+            echo "image = \"ghcr.io/remusa/manga-translator-shim@${{ steps.build.outputs.digest }}\";"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,123 @@
+name: grayjay
+
+# Grayjay Desktop ships an unversioned zip: no version endpoint, no checksum
+# endpoint (verified 2026-10-16: /Apps/Grayjay.Desktop/version.json,
+# AppVersion.json and *.zip.sha256 all 404). The zip's HTTP ETag is the only
+# change signal, so the image tag IS the ETag and the tag's existence is the
+# "already built" test.
+
+on:
+  schedule:
+    - cron: "17 4 * * 1" # Mondays 04:17 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if the ETag tag already exists
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: grayjay
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      etag: ${{ steps.up.outputs.etag }}
+      sha256: ${{ steps.up.outputs.sha256 }}
+      size: ${{ steps.up.outputs.size }}
+      exists: ${{ steps.check.outputs.exists }}
+    steps:
+      - name: Measure the upstream zip
+        id: up
+        run: |
+          set -euo pipefail
+          url=https://updater.grayjay.app/Apps/Grayjay.Desktop/Grayjay.Desktop-linux-x64.zip
+          etag=$(curl -fsSI "$url" | sed -n 's/^[Ee][Tt][Aa][Gg]: *//p' | tr -d '\r"')
+          # A missing ETag must abort: without it the tag would be empty and the
+          # "does this tag exist" test would be meaningless.
+          [ -n "$etag" ] || { echo "no ETag from upstream; refusing to guess a tag"; exit 1; }
+          curl -fsSL --retry 3 --retry-connrefused -o /tmp/gj.zip "$url"
+          sha=$(sha256sum /tmp/gj.zip | awk '{print $1}')
+          size=$(stat -c%s /tmp/gj.zip)
+          echo "etag=$etag"   >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha"   >> "$GITHUB_OUTPUT"
+          echo "size=$size"    >> "$GITHUB_OUTPUT"
+          echo "upstream zip: $size bytes, sha256 $sha, etag $etag" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Is this ETag already published?
+        id: check
+        run: |
+          set -euo pipefail
+          tag="${{ steps.up.outputs.etag }}"
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://ghcr.io/v2/remusa/grayjay/manifests/$tag")
+          echo "manifest lookup for tag $tag: HTTP $code"
+          if [ "$code" = "200" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: resolve
+    # github.event.inputs.force is a string in both event shapes, so compare to 'true'.
+    if: needs.resolve.outputs.exists != 'true' || github.event.inputs.force == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: grayjay
+          platforms: linux/amd64
+          push: true
+          # The sha256 travels with the build so the Dockerfile's optional pin is
+          # actually exercised: it re-hashes the zip and fails on any mismatch.
+          build-args: |
+            GRAYJAY_ZIP_ETAG=${{ needs.resolve.outputs.etag }}
+            GRAYJAY_ZIP_SHA256=${{ needs.resolve.outputs.sha256 }}
+          tags: |
+            ghcr.io/remusa/grayjay:${{ needs.resolve.outputs.etag }}
+            ghcr.io/remusa/grayjay:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            grayjay.zip.etag=${{ needs.resolve.outputs.etag }}
+            grayjay.zip.sha256=${{ needs.resolve.outputs.sha256 }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Record the digest to pin
+        run: |
+          {
+            echo "### grayjay built"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| etag tag | \`${{ needs.resolve.outputs.etag }}\` |"
+            echo "| zip sha256 | \`${{ needs.resolve.outputs.sha256 }}\` |"
+            echo "| zip bytes | ${{ needs.resolve.outputs.size }} |"
+            echo "| **image digest** | \`${{ steps.build.outputs.digest }}\` |"
+            echo ""
+            echo "Pin in Nix:"
+            echo ""
+            echo '```nix'
+            echo "image = \"ghcr.io/remusa/grayjay@${{ steps.build.outputs.digest }}\";"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
