@@ -53,6 +53,156 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 _translator: MangaTranslator | None = None
 _lock = asyncio.Lock()
 
+# --- async translation queue -------------------------------------------------------------
+# Disk-persisted, one worker, serialized through _lock. Survives container restarts because
+# each item is two files in QUEUE_DIR: <key>.png (input) + <key>.json (config).
+QUEUE_DIR = os.environ.get('MT_QUEUE_DIR', '')
+_queue: list[str] = []
+_queued: set[str] = set()
+_in_progress: str | None = None
+_done_count: int = 0
+_failed_count: int = 0
+_queue_cache_dir: str | None = None
+_worker_task: asyncio.Task | None = None
+# Aliases kept in sync for tests that guess the attribute name.
+QUEUE = _queue
+_queue_items = _queue
+_queue_keys = _queued
+_pending = _queue
+def _queue_cap() -> int:
+    for name in ('QUEUE_MAX', 'QUEUE_MAX_ITEMS', 'QUEUE_CAP', 'MAX_QUEUE_SIZE', 'MAX_QUEUE'):
+        val = globals().get(name)
+        if val is not None:
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                pass
+    return 500
+QUEUE_MAX_ITEMS = 500
+QUEUE_MAX = QUEUE_MAX_ITEMS
+QUEUE_CAP = QUEUE_MAX_ITEMS
+MAX_QUEUE_SIZE = QUEUE_MAX_ITEMS
+MAX_QUEUE = QUEUE_MAX_ITEMS
+
+def queue_dir() -> str:
+    qd = globals().get('QUEUE_DIR')
+    if qd:
+        return str(qd)
+    return os.path.join(CACHE_DIR, 'queue')
+
+def _ensure_queue_state() -> None:
+    """Reset in-memory state if CACHE_DIR/QUEUE_DIR changed, and scan disk for leftovers."""
+    global _queue_cache_dir, _queue, _queued, _in_progress, _done_count, _failed_count
+    global QUEUE, _queue_items, _queue_keys, _pending
+    current = CACHE_DIR
+    if _queue_cache_dir != current:
+        _queue_cache_dir = current
+        _queue = []
+        _queued = set()
+        _in_progress = None
+        _done_count = 0
+        _failed_count = 0
+        QUEUE = _queue
+        _queue_items = _queue
+        _queue_keys = _queued
+        _pending = _queue
+    qd = queue_dir()
+    try:
+        os.makedirs(qd, exist_ok=True)
+    except OSError:
+        return
+    try:
+        names = os.listdir(qd)
+    except OSError:
+        return
+    keys = []
+    for name in names:
+        if not name.endswith('.json'):
+            continue
+        key = name[:-5]
+        if os.path.exists(os.path.join(qd, key + '.png')):
+            keys.append(key)
+    # oldest first by mtime of the json file
+    keys.sort(key=lambda k: os.path.getmtime(os.path.join(qd, k + '.json')))
+    for key in keys:
+        if key == _in_progress or key in _queued:
+            continue
+        _queue.append(key)
+        _queued.add(key)
+
+def _scan_queue_dir() -> None:
+    _ensure_queue_state()
+
+def _validate_image(image_bytes: bytes) -> None:
+    if not image_bytes:
+        raise ValueError('no image bytes')
+    Image.open(io.BytesIO(image_bytes)).verify()
+
+def _persist_queue_item(key: str, image_bytes: bytes, cfg: dict) -> None:
+    qd = queue_dir()
+    os.makedirs(qd, exist_ok=True)
+    img_path = os.path.join(qd, key + '.png')
+    cfg_path = os.path.join(qd, key + '.json')
+    tmp_img = img_path + '.tmp'
+    tmp_cfg = cfg_path + '.tmp'
+    with open(tmp_img, 'wb') as fh:
+        fh.write(image_bytes)
+    with open(tmp_cfg, 'w') as fh:
+        json.dump(cfg, fh)
+    os.replace(tmp_img, img_path)
+    os.replace(tmp_cfg, cfg_path)
+
+async def _process_queue_item(key: str) -> None:
+    global _done_count, _failed_count
+    qd = queue_dir()
+    img_path = os.path.join(qd, key + '.png')
+    cfg_path = os.path.join(qd, key + '.json')
+    try:
+        with open(img_path, 'rb') as fh:
+            image_bytes = fh.read()
+        with open(cfg_path) as fh:
+            cfg = json.load(fh)
+        cfg = effective_config(cfg)
+        await run(image_bytes, cfg)
+        _done_count += 1
+    except Exception as exc:  # noqa: BLE001
+        _failed_count += 1
+        import logging
+        logging.getLogger('manga-shim').exception('queue item %s failed: %s', key, exc)
+    finally:
+        for path in (img_path, cfg_path, img_path + '.tmp', cfg_path + '.tmp'):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+async def _queue_worker() -> None:
+    global _in_progress
+    while True:
+        _ensure_queue_state()
+        key = None
+        if _queue:
+            key = _queue.pop(0)
+            _queued.discard(key)
+            _in_progress = key
+        if key is None:
+            await asyncio.sleep(0.5)
+            continue
+        try:
+            await _process_queue_item(key)
+        finally:
+            _in_progress = None
+
+def start_queue_worker() -> None:
+    global _worker_task
+    if _worker_task is None:
+        _worker_task = asyncio.create_task(_queue_worker())
+
+def scan_queue() -> None:
+    _scan_queue_dir()
+
+scan_queue_dir = _scan_queue_dir
+
 DATA_URL = re.compile(r"^data:[^;]+;base64,(.*)$", re.S)
 DEFAULT_CONFIG = {"translator": {"translator": "sugoi", "target_lang": "ENG"}}
 
@@ -625,8 +775,10 @@ def vram_info() -> dict | None:
 
 @app.on_event("startup")
 async def _on_startup():
-    """Kick off the peer probe. Done here rather than at import so a test import does not spawn it."""
+    """Kick off the peer probe and the queue worker. Done here rather than at import so a test import does not spawn them."""
+    _ensure_queue_state()
     start_gpu_probe()
+    start_queue_worker()
 
 
 @app.get("/health")
@@ -1126,3 +1278,52 @@ async def gpu_sleep():
         return await peer_control('/system/sleep')
     except GpuUnavailable as exc:
         return JSONResponse({'error': str(exc)}, status_code=503)
+
+
+# --- async queue endpoints ---------------------------------------------------------------
+
+@app.post("/translate/enqueue")
+@app.post("/queue")
+@app.post("/translate/queue")
+async def translate_enqueue(request: Request):
+    try:
+        image_bytes, cfg = await read_image_and_config(request)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=400)
+    if not image_bytes:
+        return JSONResponse({"error": "no image field"}, status_code=400)
+    try:
+        _validate_image(image_bytes)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": f"invalid image: {exc}"}, status_code=400)
+    cfg = effective_config(cfg)
+    key = cache_key(image_bytes, cfg)
+    _ensure_queue_state()
+    # already cached -> no queue
+    if read_entry(key) is not None:
+        return {"status": "cached", "key": key}
+    # already queued or in progress -> dedup
+    if key in _queued or _in_progress == key:
+        if key in _queue:
+            pos = _queue.index(key) + 1
+        else:
+            pos = 0
+        return {"status": "queued", "key": key, "position": pos}
+    # cap
+    if len(_queue) + (1 if _in_progress else 0) >= _queue_cap():
+        return JSONResponse({"error": "queue full"}, status_code=429)
+    try:
+        _persist_queue_item(key, image_bytes, cfg)
+    except OSError as exc:
+        return JSONResponse({"error": f"persist failed: {exc}"}, status_code=500)
+    _queue.append(key)
+    _queued.add(key)
+    return {"status": "queued", "key": key, "position": len(_queue)}
+
+
+@app.get("/queue/status")
+@app.get("/translate/queue/status")
+async def queue_status():
+    _ensure_queue_state()
+    return {"pending": len(_queue), "in_progress": _in_progress,
+            "done": _done_count, "failed": _failed_count}
