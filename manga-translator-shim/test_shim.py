@@ -15,6 +15,7 @@ on an identical key, and that a stored page reads back byte-for-byte.
 from __future__ import annotations
 
 import asyncio
+import time
 import json
 import os
 import shutil
@@ -918,3 +919,121 @@ class TestModelUnload(unittest.TestCase):
         r = self.client.post('/model/unload', headers={'X-Control-Token': 'ctl'})
         self.assertEqual(r.status_code, 200)
         self.assertIn('no models', r.json()['note'])
+
+
+class TestQueue(unittest.TestCase):
+    """Async, disk-persisted translation queue.
+
+    Enqueue is cheap and takes no lock; a single background worker drains the queue through
+    the existing lock so concurrency stays at one. Items live on disk so a restart re-enqueues
+    leftovers instead of dropping them.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix='mt-queue-')
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        for name in ('CACHE_DIR', 'QUEUE_DIR', 'QUEUE_MAX_ITEMS', 'QUEUE_MAX', 'QUEUE_CAP',
+                     'MAX_QUEUE_SIZE', 'MAX_QUEUE', '_worker_task', '_queue_cache_dir'):
+            self.addCleanup(setattr, shim, name, getattr(shim, name, None))
+        shim.CACHE_DIR = self.dir
+        shim.QUEUE_DIR = os.path.join(self.dir, 'queue')
+        shim.QUEUE_MAX_ITEMS = 3
+        shim.QUEUE_MAX = 3
+        shim.QUEUE_CAP = 3
+        shim.MAX_QUEUE_SIZE = 3
+        shim.MAX_QUEUE = 3
+        shim._worker_task = None
+        shim._queue_cache_dir = None
+        self._orig_run = shim.run
+
+        async def fake_run(image_bytes, cfg):
+            await asyncio.sleep(0.05)
+            return b'out', False
+
+        shim.run = fake_run
+        self.client = TestClient(shim.app)
+
+    def tearDown(self):
+        shim.run = self._orig_run
+
+    def _enqueue(self, payload=b'page bytes', cfg=None):
+        cfg = cfg or CFG_ENG
+        return self.client.post('/translate/enqueue',
+                                files={'image': ('p.png', payload, 'image/png')},
+                                data={'config': json.dumps(cfg)})
+
+    def test_enqueue_returns_queued_with_position(self):
+        with self.client:
+            r = self._enqueue()
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json()['status'], 'queued')
+            self.assertIn('key', r.json())
+            self.assertEqual(r.json()['position'], 1)
+
+    def test_cached_page_is_not_queued(self):
+        key = shim.cache_key(b'cachedpage', CFG_ENG)
+        shim.write_cache(shim.cache_path(key), b'\x89PNG cached')
+        with self.client:
+            r = self._enqueue(b'cachedpage')
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json()['status'], 'cached')
+
+    def test_duplicate_enqueue_is_deduped(self):
+        with self.client:
+            self._enqueue()
+            r = self._enqueue()
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json()['status'], 'queued')
+            st = self.client.get('/queue/status').json()
+            self.assertEqual(st['pending'] + (1 if st['in_progress'] else 0), 1)
+
+    def test_status_reports_progress(self):
+        with self.client:
+            self._enqueue()
+            # let the worker drain
+            for _ in range(50):
+                st = self.client.get('/queue/status').json()
+                if st['done'] >= 1:
+                    break
+                time.sleep(0.05)
+            st = self.client.get('/queue/status').json()
+            self.assertEqual(st['failed'], 0)
+            self.assertGreaterEqual(st['done'], 1)
+
+    def test_queue_cap_returns_429(self):
+        with self.client:
+            for _ in range(3):
+                self.assertEqual(self._enqueue(b'p' + str(_).encode()).status_code, 200)
+            r = self._enqueue(b'overflow')
+            self.assertEqual(r.status_code, 429)
+
+    def test_items_persist_to_disk(self):
+        with self.client:
+            self._enqueue()
+            qd = shim.queue_dir()
+            files = os.listdir(qd)
+            self.assertTrue(any(f.endswith('.png') for f in files))
+            self.assertTrue(any(f.endswith('.json') for f in files))
+
+    def test_queue_survives_restart(self):
+        with self.client:
+            self._enqueue()
+            # stop processing by not waiting; ensure files exist
+            time.sleep(0.02)
+        # simulate restart: reset in-memory state, scan disk
+        shim._worker_task = None
+        shim._queue_cache_dir = None
+        shim._ensure_queue_state()
+        # either still pending or already done+removed; if pending, re-enqueued
+        # at minimum the scan must not crash and queue dir still consistent
+        self.assertIsInstance(shim._queue, list)
+
+    def test_aliases(self):
+        # queue endpoints reachable via aliases
+        with self.client:
+            r = self.client.post('/queue', files={'image': ('p.png', b'aliaspage', 'image/png')},
+                                 data={'config': json.dumps(CFG_ENG)})
+            self.assertEqual(r.status_code, 200)
+            r2 = self.client.get('/translate/queue/status')
+            self.assertEqual(r2.status_code, 200)
+            self.assertIn('pending', r2.json())

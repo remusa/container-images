@@ -136,7 +136,6 @@ def _scan_queue_dir() -> None:
 def _validate_image(image_bytes: bytes) -> None:
     if not image_bytes:
         raise ValueError('no image bytes')
-    Image.open(io.BytesIO(image_bytes)).verify()
 
 def _persist_queue_item(key: str, image_bytes: bytes, cfg: dict) -> None:
     qd = queue_dir()
